@@ -1,0 +1,23 @@
+# Keil / build outputs (too large for GitHub; rebuild locally)
+**/objects/
+**/listings/
+**/*.SBR
+**/*.__i
+**/*.lst
+**/*.obj
+**/*.lnp
+**/*.build_log.htm
+**/*.MAP
+**/*.map
+
+# IDE / local session junk
+*.uvgui.*
+*.uvguix.*
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Optional local scratch
+*.o
+*.d
