@@ -191,12 +191,29 @@ int32 icmp_echo_send(ip_addr_t dst, uint16 ident, uint16 seq) large
     pktBuf_t   xdata *pBuf_Xmit = &pktbuf;
     icmp_hdr_t xdata *pIcmpHdr_Xmit;
     eth_addr_t xdata mac;
+    ip_addr_t  xdata nh;
     uint8      xdata *pPayload;
     uint8      xdata i;
     uint16     xdata icmp_len;
 
-    /* eth_down drops IP frames with no ARP entry -- fail early */
-    if (LWPS_OK != etharp_entry_find(&dst, &mac))
+    /*
+     * eth_down drops IP frames when the L2 nexthop has no ARP entry.
+     * Same-subnet: nexthop is the target (unchanged).
+     * Off-subnet: nexthop is the default gateway (same as eth_down).
+     */
+    if (  (dst.addr[0] & netmask[0]) != (this_ip[0] & netmask[0]) ||
+          (dst.addr[1] & netmask[1]) != (this_ip[1] & netmask[1]) ||
+          (dst.addr[2] & netmask[2]) != (this_ip[2] & netmask[2]) ||
+          (dst.addr[3] & netmask[3]) != (this_ip[3] & netmask[3])    )
+    {
+        IPADDR_COPY(nh.addr, default_gateway.addr);
+    }
+    else
+    {
+        IPADDR_COPY(nh.addr, dst.addr);
+    }
+
+    if (LWPS_OK != etharp_entry_find(&nh, &mac))
     {
         return LWPS_ERR;
     }
