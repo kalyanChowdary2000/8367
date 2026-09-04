@@ -328,19 +328,75 @@ int32 get_cable_diag(http_request_t *pReq)
 
 #endif
 
-#define PING_COUNT   4
+#define PING_COUNT       4
+#define PING_ARP_TRIES   3
+#define PING_LOG_PEND    0
+#define PING_LOG_OK      1
+#define PING_LOG_TO      2
+#define PING_LOG_SEND    3
+
+static uint8 ping_same_subnet(ip_addr_t *ip)
+{
+    if (((ip->addr[0] & netmask[0]) != (this_ip[0] & netmask[0])) ||
+        ((ip->addr[1] & netmask[1]) != (this_ip[1] & netmask[1])) ||
+        ((ip->addr[2] & netmask[2]) != (this_ip[2] & netmask[2])) ||
+        ((ip->addr[3] & netmask[3]) != (this_ip[3] & netmask[3])))
+    {
+        return 0;
+    }
+    return 1;
+}
+
+static uint8 ping_ip_not_usable(ip_addr_t *ip)
+{
+    if (ip->addr[0] == 0 && ip->addr[1] == 0 && ip->addr[2] == 0 && ip->addr[3] == 0)
+        return 1;
+    if (ip->addr[0] == 255 && ip->addr[1] == 255 && ip->addr[2] == 255 && ip->addr[3] == 255)
+        return 1;
+    if (ip->addr[0] >= 224 && ip->addr[0] <= 239)
+        return 1;
+    return 0;
+}
+
+static void ping_nexthop(ip_addr_t *dst, ip_addr_t *nh)
+{
+    if (ping_same_subnet(dst))
+        IPADDR_COPY(nh->addr, dst->addr);
+    else
+        IPADDR_COPY(nh->addr, default_gateway.addr);
+}
+
+static uint8 ping_gateway_missing(ip_addr_t *dst)
+{
+    if (ping_same_subnet(dst))
+        return 0;
+    if (default_gateway.addr[0] == 0 && default_gateway.addr[1] == 0 &&
+        default_gateway.addr[2] == 0 && default_gateway.addr[3] == 0)
+        return 1;
+    return 0;
+}
+
+static const char *ping_finish_status(uint8 sent, uint8 recv)
+{
+    if (recv == 0)
+        return "Unreachable (100% loss)";
+    if (recv < sent)
+        return "Completed (partial loss)";
+    return "Completed";
+}
 
 /*
  * Real ICMP ping (Echo Request/Reply).
  *
- * eth_down() drops IP packets when no ARP entry exists, so we must
- * resolve ARP first, then send ICMP. Non-blocking multi-phase via
- * meta-refresh (never wait inside the HTTP handler).
+ * eth_down() drops IP packets when the L2 nexthop has no ARP entry, so we
+ * resolve ARP first (target on LAN, default gateway off-LAN), then send
+ * ICMP. Non-blocking multi-phase via meta-refresh (never wait inside the
+ * HTTP handler).
  *
- * Phases driven by query flag r:
- *   (none)  - start: ARP request
- *   r=1     - ARP ready? send ICMP #0
- *   r=2..N  - check previous reply, send next / finish
+ * Query flag r is only a continue marker (always r=1 on refresh). Phase
+ * lives in statics:
+ *   (none)  - start: ARP request if needed
+ *   r=1     - continue current phase (ARP wait or ICMP poll)
  */
 int32 get_ping(struct http_request_s *pReq)
 {
@@ -348,10 +404,12 @@ int32 get_ping(struct http_request_s *pReq)
     static uint8      ping_phase   = 0;   /* 0=idle 1=wait ARP 2=ICMP in progress */
     static uint8      ping_sent    = 0;
     static uint8      ping_recv    = 0;
+    static uint8      ping_arp_try = 0;
     static uint16     ping_ident   = 0;
     static uint16     ping_ident_seed = 0;
     static ip_addr_t  ping_target;
-    static uint8      ping_log[PING_COUNT]; /* 0=pend 1=ok 2=timeout */
+    static ip_addr_t  ping_nh;
+    static uint8      ping_log[PING_COUNT]; /* 0=pend 1=ok 2=timeout 3=send fail */
 
     uint8           *pValue;
     uint8           *pCheck;
@@ -395,6 +453,18 @@ int32 get_ping(struct http_request_s *pReq)
                 ping_active = 0;
                 ping_phase = 0;
             }
+            else if (ping_ip_not_usable(&tip))
+            {
+                pResult = "Invalid IP";
+                ping_active = 0;
+                ping_phase = 0;
+            }
+            else if (ping_gateway_missing(&tip))
+            {
+                pResult = "No default gateway";
+                ping_active = 0;
+                ping_phase = 0;
+            }
             else
             {
                 showTable = 1;
@@ -410,12 +480,14 @@ int32 get_ping(struct http_request_s *pReq)
                     ping_active = 1;
                     ping_sent = 0;
                     ping_recv = 0;
+                    ping_arp_try = 0;
                     IPADDR_COPY(ping_target.addr, tip.addr);
+                    ping_nexthop(&tip, &ping_nh);
                     for (i = 0; i < PING_COUNT; i++)
                         ping_log[i] = 0;
 
                     /* If ARP already known, send ICMP now; else ARP first */
-                    if (LWPS_OK == etharp_entry_find(&tip, &mac))
+                    if (LWPS_OK == etharp_entry_find(&ping_nh, &mac))
                     {
                         icmp_echo_reply_clear();
                         if (LWPS_OK == icmp_echo_send(ping_target, ping_ident, 0))
@@ -427,9 +499,9 @@ int32 get_ping(struct http_request_s *pReq)
                         }
                         else
                         {
-                            /* Send failed - force re-ARP */
-                            (void)etharp_entry_clear(&tip);
-                            (void)lwps_arp_request(tip);
+                            /* Send failed - force re-ARP of nexthop */
+                            (void)etharp_entry_clear(&ping_nh);
+                            (void)lwps_arp_request(ping_nh);
                             ping_phase = 1;
                             waiting = 1;
                             pResult = "Resolving...";
@@ -437,7 +509,7 @@ int32 get_ping(struct http_request_s *pReq)
                     }
                     else
                     {
-                        (void)lwps_arp_request(tip);
+                        (void)lwps_arp_request(ping_nh);
                         ping_phase = 1;
                         waiting = 1;
                         pResult = "Resolving...";
@@ -446,7 +518,7 @@ int32 get_ping(struct http_request_s *pReq)
                 else if (ping_active && ping_phase == 1)
                 {
                     /* ARP result phase */
-                    if (LWPS_OK == etharp_entry_find(&ping_target, &mac))
+                    if (LWPS_OK == etharp_entry_find(&ping_nh, &mac))
                     {
                         icmp_echo_reply_clear();
                         if (LWPS_OK == icmp_echo_send(ping_target, ping_ident, 0))
@@ -463,46 +535,75 @@ int32 get_ping(struct http_request_s *pReq)
                             pResult = "Send failed";
                         }
                     }
+                    else if (ping_arp_try + 1 < PING_ARP_TRIES)
+                    {
+                        ping_arp_try++;
+                        (void)lwps_arp_request(ping_nh);
+                        waiting = 1;
+                        pResult = "Resolving...";
+                    }
                     else
                     {
                         ping_active = 0;
                         ping_phase = 0;
-                        pResult = "Unreachable (no ARP)";
-                        for (i = 0; i < PING_COUNT; i++)
-                            ping_log[i] = 2;
-                        ping_sent = PING_COUNT;
+                        pResult = ping_same_subnet(&ping_target) ?
+                                  "Unreachable (no ARP)" :
+                                  "Unreachable (no gateway ARP)";
+                        ping_sent = 0;
+                        showTable = 0;
                     }
                 }
                 else if (ping_active && ping_phase == 2)
                 {
-                    /* Check previous ICMP reply */
+                    /* Check previous ICMP reply (skip slots that never left) */
                     if (ping_sent > 0)
                     {
                         idx = ping_sent - 1;
-                        if (icmp_echo_reply_check(ping_ident, idx))
+                        if (ping_log[idx] != PING_LOG_SEND)
                         {
-                            ping_recv++;
-                            ping_log[idx] = 1;
+                            if (icmp_echo_reply_check(ping_ident, idx))
+                            {
+                                ping_recv++;
+                                ping_log[idx] = PING_LOG_OK;
+                            }
+                            else
+                            {
+                                ping_log[idx] = PING_LOG_TO;
+                            }
+                            icmp_echo_reply_clear();
                         }
-                        else
-                        {
-                            ping_log[idx] = 2;
-                        }
-                        icmp_echo_reply_clear();
                     }
 
                     if (ping_sent < PING_COUNT)
                     {
-                        (void)icmp_echo_send(ping_target, ping_ident, ping_sent);
-                        ping_sent++;
-                        waiting = 1;
-                        pResult = "Testing...";
+                        if (LWPS_OK == icmp_echo_send(ping_target, ping_ident, ping_sent))
+                        {
+                            ping_sent++;
+                            waiting = 1;
+                            pResult = "Testing...";
+                        }
+                        else
+                        {
+                            ping_log[ping_sent] = PING_LOG_SEND;
+                            ping_sent++;
+                            if (ping_sent < PING_COUNT)
+                            {
+                                waiting = 1;
+                                pResult = "Testing...";
+                            }
+                            else
+                            {
+                                ping_active = 0;
+                                ping_phase = 0;
+                                pResult = ping_finish_status(ping_sent, ping_recv);
+                            }
+                        }
                     }
                     else
                     {
                         ping_active = 0;
                         ping_phase = 0;
-                        pResult = (ping_recv > 0) ? "Completed" : "Unreachable (100% loss)";
+                        pResult = ping_finish_status(ping_sent, ping_recv);
                     }
                 }
                 else
@@ -562,10 +663,12 @@ int32 get_ping(struct http_request_s *pReq)
         for (i = 0; i < ping_sent; i++)
         {
             WEB_PRINTF(pReq, "<tr><td>%d</td><td>%s</td>", (uint16)(i + 1), ipStr);
-            if (ping_log[i] == 1)
+            if (ping_log[i] == PING_LOG_OK)
                 WEB_PRINTF(pReq, "<td class=\"ok\">Reply received</td></tr>\n");
-            else if (ping_log[i] == 2)
+            else if (ping_log[i] == PING_LOG_TO)
                 WEB_PRINTF(pReq, "<td class=\"fail\">Request timed out</td></tr>\n");
+            else if (ping_log[i] == PING_LOG_SEND)
+                WEB_PRINTF(pReq, "<td class=\"fail\">Send failed</td></tr>\n");
             else
                 WEB_PRINTF(pReq, "<td class=\"pend\">Waiting...</td></tr>\n");
         }
